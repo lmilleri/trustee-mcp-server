@@ -610,50 +610,32 @@ def detect_cluster_config() -> str:
 @mcp.tool()
 def detect_kata_kernel_params() -> str:
     """
-    Detect the default kernel parameters used by kata-cc pods.
+    Detect the kernel parameters from the test-pod.yaml.in template.
 
-    This checks:
-    1. Running kata-cc pods for their kernel_params annotation
-    2. The kata-cc RuntimeClass configuration
-    3. Falls back to common default if none found
+    This reads the kernel_params annotation from the template file to ensure
+    generated reference values match what the test pod will actually use.
 
     Returns:
         Kernel parameters string or error message
     """
-    # Method 1: Check running kata-cc pods for kernel_params annotation
-    pods_cmd = 'kubectl get pods -A -o json | jq -r \'.items[] | select(.spec.runtimeClassName == "kata-cc") | .metadata.annotations["io.katacontainers.config.hypervisor.kernel_params"] // empty\' | head -1'
-    result = subprocess.run(pods_cmd, shell=True, capture_output=True, text=True)
+    import re
 
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
+    # Check local test-pod.yaml.in template (authoritative source)
+    template_file = "test-pod.yaml.in"
+    if not os.path.exists(template_file):
+        return f"Error: {template_file} not found in current directory"
 
-    # Method 2: Check RuntimeClass for default kernel params
-    # Note: RuntimeClass doesn't directly store kernel params, but we can check if there's a ConfigMap
-    rc_cmd = 'kubectl get runtimeclass kata-cc -o json 2>/dev/null | jq -r .handler'
-    result = subprocess.run(rc_cmd, shell=True, capture_output=True, text=True)
-
-    if result.returncode == 0 and result.stdout.strip():
-        # Try to find kata configuration
-        kata_config_cmd = 'kubectl get configmap kata-config -n kube-system -o jsonpath=\'{.data.configuration\\.toml}\' 2>/dev/null | grep kernel_params || true'
-        result = subprocess.run(kata_config_cmd, shell=True, capture_output=True, text=True)
-
-        if result.stdout.strip():
-            # Extract kernel_params value from TOML
-            import re
-            match = re.search(r'kernel_params\s*=\s*"([^"]*)"', result.stdout)
+    try:
+        with open(template_file, 'r') as f:
+            template_content = f.read()
+            # Extract kernel_params from the annotation
+            match = re.search(r'io\.katacontainers\.config\.hypervisor\.kernel_params:\s*"([^"]*)"', template_content)
             if match:
                 return match.group(1)
-
-    # Method 3: Check for peer-pods configuration
-    peerPods_cmd = 'kubectl get configmap peer-pods-cm -n openshift-sandboxed-containers-operator -o jsonpath=\'{.data.KERNEL_PARAMS}\' 2>/dev/null || true'
-    result = subprocess.run(peerPods_cmd, shell=True, capture_output=True, text=True)
-
-    if result.returncode == 0 and result.stdout.strip():
-        return result.stdout.strip()
-
-    # Default: Common kernel param for guest components
-    # This is the most common setup for confidential containers
-    return "agent.guest_components_rest_api=all"
+            else:
+                return "Error: kernel_params annotation not found in template"
+    except Exception as e:
+        return f"Error: Failed to read template: {e}"
 
 @mcp.tool()
 def update_reference_values_configmap() -> str:
