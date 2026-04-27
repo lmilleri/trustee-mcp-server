@@ -55,8 +55,18 @@ This MCP server enables AI assistants (like Claude) to interact with confidentia
 ### Prerequisites
 - Python 3.14+
 - Access to a Kubernetes/OpenShift cluster with `kubectl`/`oc` configured
-- Trustee operator repository at `/home/lmilleri/git/trustee-operator`
-- Veritas tool repository at `/home/lmilleri/git/veritas`
+- Trustee operator repository (cloned locally)
+- Veritas tool repository (cloned locally)
+
+### Clone Required Repositories
+
+```bash
+# Clone the trustee-operator repository
+git clone https://github.com/confidential-containers/trustee-operator.git ~/git/trustee-operator
+
+# Clone the veritas repository
+git clone https://github.com/confidential-containers/veritas.git ~/git/veritas
+```
 
 ### Install Dependencies
 
@@ -67,6 +77,21 @@ pip install mcp kubernetes pyyaml veritas
 # Or using uv
 uv sync
 ```
+
+### Configure Paths
+
+Copy the example environment file and adjust paths if needed:
+
+```bash
+cp .env.example .env
+# Edit .env to set custom paths if your repositories are in different locations
+```
+
+The server uses the following environment variables with defaults:
+- `TRUSTEE_REPO_PATH` - Path to trustee-operator repository (default: `~/git/trustee-operator`)
+- `VERITAS_REPO_PATH` - Path to veritas repository (default: `~/git/veritas`)
+
+If your repositories are in the default locations, no configuration is needed.
 
 ### Running the Server
 
@@ -80,9 +105,21 @@ python server.py
 
 ## Configuration
 
-The server expects the following paths (modify `server.py` if your paths differ):
-- `TRUSTEE_REPO_PATH = "/home/lmilleri/git/trustee-operator"`
-- `VERITAS_REPO_PATH = "/home/lmilleri/git/veritas"`
+### Environment Variables
+
+The server can be configured using environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TRUSTEE_REPO_PATH` | Path to trustee-operator repository | `~/git/trustee-operator` |
+| `VERITAS_REPO_PATH` | Path to veritas repository | `~/git/veritas` |
+
+You can set these in a `.env` file (copy from `.env.example`) or export them in your shell:
+
+```bash
+export TRUSTEE_REPO_PATH=/path/to/trustee-operator
+export VERITAS_REPO_PATH=/path/to/veritas
+```
 
 ## Available Tools
 

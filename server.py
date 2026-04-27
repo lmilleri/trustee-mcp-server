@@ -8,8 +8,9 @@ import json
 # Initialize FastMCP Server
 mcp = FastMCP("Trustee-Troubleshooter")
 
-TRUSTEE_REPO_PATH = "/home/lmilleri/git/trustee-operator"
-VERITAS_REPO_PATH= "/home/lmilleri/git/veritas"
+# Configuration: Use environment variables with fallback defaults
+TRUSTEE_REPO_PATH = os.getenv("TRUSTEE_REPO_PATH", os.path.expanduser("~/git/trustee-operator"))
+VERITAS_REPO_PATH = os.getenv("VERITAS_REPO_PATH", os.path.expanduser("~/git/veritas"))
 
 @mcp.tool()
 def list_trustee_resources() -> str:
