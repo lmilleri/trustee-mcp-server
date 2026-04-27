@@ -121,12 +121,17 @@ def generate_initdata() -> str:
 @mcp.tool()
 def generate_test_pod() -> str:
     """Generate test-pod.yaml from template by gzipping and base64-encoding initdata.toml."""
-    # Read initdata.toml
+    # Always regenerate initdata.toml first to ensure fresh certs
+    initdata_result = generate_initdata()
+    if initdata_result.startswith("Error:"):
+        return f"Failed to generate fresh initdata: {initdata_result}"
+
+    # Read the freshly generated initdata.toml
     try:
         with open("initdata.toml", "r") as f:
             initdata_content = f.read()
     except FileNotFoundError:
-        return "Error: initdata.toml not found. Run generate_initdata() first."
+        return "Error: initdata.toml not found after generation attempt."
 
     # Gzip and base64 encode the initdata content (equivalent to: cat initdata.toml | gzip | base64 -w0)
     initdata_gzipped = gzip.compress(initdata_content.encode('utf-8'))
@@ -366,6 +371,13 @@ def generate_reference_values(
             return f"Failed to auto-detect OCP version: {ocp_version}"
         auto_detected.append(f"OCP version: {ocp_version}")
 
+    # Auto-detect kernel cmdline if not provided (critical for matching actual pod measurements)
+    if kernel_cmdline is None:
+        detected_kernel_params = detect_kata_kernel_params()
+        if not detected_kernel_params.startswith("Error"):
+            kernel_cmdline = detected_kernel_params
+            auto_detected.append(f"kernel_params: {kernel_cmdline}")
+
     # Validate platform
     if platform not in ["azure", "baremetal"]:
         return "Error: platform must be 'azure' or 'baremetal'"
@@ -375,7 +387,7 @@ def generate_reference_values(
 
     # Build the command
     cmd = [
-        "python3", "-m", "veritas",
+        "veritas",
         "--platform", platform,
         "--tee", tee
     ]
@@ -415,11 +427,10 @@ def generate_reference_values(
     if verbose:
         cmd.append("-v")
 
-    # Change to veritas directory and run
+    # Run veritas command
     try:
         result = subprocess.run(
             cmd,
-            cwd=VERITAS_REPO_PATH,
             capture_output=True,
             text=True,
             timeout=300  # 5 minute timeout
@@ -597,15 +608,63 @@ def detect_cluster_config() -> str:
     return json.dumps(config, indent=2)
 
 @mcp.tool()
+def detect_kata_kernel_params() -> str:
+    """
+    Detect the default kernel parameters used by kata-cc pods.
+
+    This checks:
+    1. Running kata-cc pods for their kernel_params annotation
+    2. The kata-cc RuntimeClass configuration
+    3. Falls back to common default if none found
+
+    Returns:
+        Kernel parameters string or error message
+    """
+    # Method 1: Check running kata-cc pods for kernel_params annotation
+    pods_cmd = 'kubectl get pods -A -o json | jq -r \'.items[] | select(.spec.runtimeClassName == "kata-cc") | .metadata.annotations["io.katacontainers.config.hypervisor.kernel_params"] // empty\' | head -1'
+    result = subprocess.run(pods_cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+
+    # Method 2: Check RuntimeClass for default kernel params
+    # Note: RuntimeClass doesn't directly store kernel params, but we can check if there's a ConfigMap
+    rc_cmd = 'kubectl get runtimeclass kata-cc -o json 2>/dev/null | jq -r .handler'
+    result = subprocess.run(rc_cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode == 0 and result.stdout.strip():
+        # Try to find kata configuration
+        kata_config_cmd = 'kubectl get configmap kata-config -n kube-system -o jsonpath=\'{.data.configuration\\.toml}\' 2>/dev/null | grep kernel_params || true'
+        result = subprocess.run(kata_config_cmd, shell=True, capture_output=True, text=True)
+
+        if result.stdout.strip():
+            # Extract kernel_params value from TOML
+            import re
+            match = re.search(r'kernel_params\s*=\s*"([^"]*)"', result.stdout)
+            if match:
+                return match.group(1)
+
+    # Method 3: Check for peer-pods configuration
+    peerPods_cmd = 'kubectl get configmap peer-pods-cm -n openshift-sandboxed-containers-operator -o jsonpath=\'{.data.KERNEL_PARAMS}\' 2>/dev/null || true'
+    result = subprocess.run(peerPods_cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+
+    # Default: Common kernel param for guest components
+    # This is the most common setup for confidential containers
+    return "agent.guest_components_rest_api=all"
+
+@mcp.tool()
 def update_reference_values_configmap() -> str:
     """
-    Update the trusteeconfig-rvps-reference-values ConfigMap with values from rvps-reference-values.
+    Update the trusteeconfig-rvps-reference-values ConfigMap with values from rvps-reference-values.yaml.
 
-    This syncs the generated reference values (from rvps-reference-values ConfigMap) to the
-    operator-managed ConfigMap (trusteeconfig-rvps-reference-values) that is mounted by the
-    trustee deployment.
+    This reads the generated reference values from the local rvps-reference-values.yaml file and
+    updates the operator-managed ConfigMap (trusteeconfig-rvps-reference-values) that is mounted
+    by the trustee deployment.
 
-    The source ConfigMap has data in the 'reference-values' key (YAML string), while the
+    The source YAML file has data in the 'reference-values' key (YAML string), while the
     target ConfigMap needs it in the 'reference-values.json' key (JSON string) which is
     what RVPS actually reads.
 
@@ -615,21 +674,25 @@ def update_reference_values_configmap() -> str:
     try:
         import yaml
         import tempfile
+        import os
 
-        # Get the reference values data from source ConfigMap
-        result = subprocess.run(
-            ["kubectl", "get", "configmap", "rvps-reference-values", "-n", "trustee-operator-system",
-             "-o", "jsonpath={.data.reference-values}"],
-            capture_output=True, text=True
-        )
+        # Check if local rvps-reference-values.yaml exists
+        yaml_file = "rvps-reference-values.yaml"
+        if not os.path.exists(yaml_file):
+            return f"Error: {yaml_file} not found. Run generate_reference_values() first."
 
-        if result.returncode != 0:
-            return "Error: Source ConfigMap 'rvps-reference-values' not found. Run generate_reference_values() first."
+        # Read and parse the generated YAML file
+        with open(yaml_file, 'r') as f:
+            source_cm = yaml.safe_load(f)
 
-        ref_values = result.stdout
+        # Extract the reference values
+        if 'data' not in source_cm or 'reference-values' not in source_cm['data']:
+            return f"Error: {yaml_file} does not contain reference-values data."
+
+        ref_values = source_cm['data']['reference-values']
 
         if not ref_values or ref_values.strip() == "":
-            return "Error: Source ConfigMap 'rvps-reference-values' has no data in 'reference-values' key."
+            return "Error: reference-values data is empty in the YAML file."
 
         # Get the current target ConfigMap
         result = subprocess.run(
@@ -649,9 +712,6 @@ def update_reference_values_configmap() -> str:
 
         cm['data']['reference-values.json'] = ref_values
 
-        # Also update the reference-values key for consistency
-        cm['data']['reference-values'] = ref_values
-
         # Write to temporary file and apply
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             yaml.dump(cm, f)
@@ -668,7 +728,7 @@ def update_reference_values_configmap() -> str:
 
             return (
                 "Successfully updated trusteeconfig-rvps-reference-values ConfigMap.\n"
-                "Updated both 'reference-values' and 'reference-values.json' keys.\n\n"
+                "Updated 'reference-values.json' key (used by RVPS).\n\n"
                 "The new reference values will be automatically synced to the trustee pod within 60-90 seconds.\n"
                 "To force immediate pickup, restart the trustee deployment:\n"
                 "  kubectl rollout restart deployment/trustee-deployment -n trustee-operator-system"
