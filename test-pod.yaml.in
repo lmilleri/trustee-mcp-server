@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ocp-cc-pod
+  labels:
+    app: ocp-cc-pod
+  annotations:
+    io.katacontainers.config.hypervisor.cc_init_data: "${INITDATA}"
+    io.katacontainers.config.hypervisor.kernel_params: "agent.guest_components_rest_api=all"
+spec:
+  runtimeClassName: kata-cc
+  containers:
+    - name: skr-openshift
+      image: registry.access.redhat.com/ubi9/ubi:9.3
+      command:
+        - sleep
+        - "36000"
+      securityContext:
+        privileged: false
+        seccompProfile:
+          type: RuntimeDefault
