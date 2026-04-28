@@ -94,7 +94,26 @@ def download_pull_secret(output_file: str = "pull-secret.json") -> str:
 @mcp.tool()
 def generate_initdata() -> str:
     """Generate initdata.toml from template by fetching TRUSTEE_URL and TRUSTEE_CERT from the cluster."""
-    # Get the Trustee URL and certificate using existing functions
+    # Detect the profile type from TrusteeConfig
+    profile_cmd = "kubectl get trusteeconfig trusteeconfig -n trustee-operator-system -o jsonpath='{.spec.profileType}' 2>/dev/null"
+    profile_result = subprocess.run(profile_cmd, shell=True, capture_output=True, text=True)
+    profile_type = profile_result.stdout.strip().lower() if profile_result.returncode == 0 else "restrictive"
+
+    # For permissive mode, use the permissive template (no variable substitution needed)
+    if profile_type == "permissive":
+        try:
+            with open("initdata-permissive.toml.in", "r") as f:
+                template = f.read()
+        except FileNotFoundError:
+            return "Error: initdata-permissive.toml.in template file not found"
+
+        # Write directly (no substitution needed for permissive)
+        with open("initdata.toml", "w") as f:
+            f.write(template)
+
+        return f"Successfully generated initdata.toml for permissive mode (HTTP, no certificates)"
+
+    # For restrictive mode, use the original template with certificate substitution
     trustee_url = get_trustee_url()
     trustee_cert = get_https_certs()
 
@@ -118,7 +137,7 @@ def generate_initdata() -> str:
     with open("initdata.toml", "w") as f:
         f.write(output)
 
-    return f"Successfully generated initdata.toml with:\n  URL: {trustee_url}\n  Certificate: {len(trustee_cert)} bytes"
+    return f"Successfully generated initdata.toml for restrictive mode with:\n  URL: {trustee_url}\n  Certificate: {len(trustee_cert)} bytes"
 
 @mcp.tool()
 def generate_test_pod() -> str:
