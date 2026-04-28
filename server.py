@@ -4,6 +4,8 @@ import os
 import base64
 import gzip
 import json
+import hashlib
+import yaml
 
 # Initialize FastMCP Server
 mcp = FastMCP("Trustee-Troubleshooter")
@@ -120,8 +122,15 @@ def generate_initdata() -> str:
 
 @mcp.tool()
 def generate_test_pod() -> str:
-    """Generate test-pod.yaml from template by gzipping and base64-encoding initdata.toml."""
-    # Always regenerate initdata.toml first to ensure fresh certs
+    """
+    Generate test-pod.yaml from template by gzipping and base64-encoding initdata.toml.
+
+    IMPORTANT: This function regenerates initdata.toml from the cluster to ensure it uses
+    the current certificate. For attestation to succeed, reference values MUST be generated
+    with the same initdata.toml. Use update_reference_values_configmap() before deploying
+    the test pod to ensure they match.
+    """
+    # Always regenerate initdata.toml from cluster to ensure fresh/current certs
     initdata_result = generate_initdata()
     if initdata_result.startswith("Error:"):
         return f"Failed to generate fresh initdata: {initdata_result}"
@@ -427,6 +436,14 @@ def generate_reference_values(
     if verbose:
         cmd.append("-v")
 
+    # Clean up any existing reference values file to ensure fresh generation
+    yaml_file = os.path.join(output_dir, "rvps-reference-values.yaml")
+    if os.path.exists(yaml_file):
+        try:
+            os.remove(yaml_file)
+        except Exception as e:
+            return f"Error: Failed to remove existing reference values file {yaml_file}: {e}"
+
     # Run veritas command
     try:
         result = subprocess.run(
@@ -438,6 +455,42 @@ def generate_reference_values(
 
         if result.returncode != 0:
             return f"Error: veritas failed with exit code {result.returncode}\n\nStderr:\n{result.stderr}\n\nStdout:\n{result.stdout}"
+
+        # Post-process: Fix init_data hash for SHA256 algorithm
+        # Veritas always generates SHA384 regardless of algorithm field, but pods use SHA256
+        try:
+            # Read the initdata.toml to check the algorithm
+            with open(initdata, 'r') as f:
+                initdata_content = f.read()
+                if 'algorithm = "sha256"' in initdata_content:
+                    # Compute SHA256 of initdata.toml
+                    with open(initdata, 'rb') as fb:
+                        sha256_hash = hashlib.sha256(fb.read()).hexdigest()
+
+                    # Load the generated YAML
+                    yaml_file = os.path.join(output_dir, "rvps-reference-values.yaml")
+                    with open(yaml_file, 'r') as f:
+                        rvps_yaml = yaml.safe_load(f)
+
+                    # Parse the reference-values JSON string
+                    ref_values_str = rvps_yaml['data']['reference-values']
+                    ref_values = json.loads(ref_values_str.strip())
+
+                    # Find and replace init_data value with SHA256
+                    for item in ref_values:
+                        if item['name'] == 'init_data':
+                            item['value'] = [sha256_hash]
+                            break
+
+                    # Write back the modified YAML
+                    rvps_yaml['data']['reference-values'] = json.dumps(ref_values, indent=2) + '\n'
+                    with open(yaml_file, 'w') as f:
+                        yaml.dump(rvps_yaml, f, default_flow_style=False, sort_keys=False)
+
+                    auto_detected.append("init_data: converted to SHA256")
+        except Exception as e:
+            # Don't fail the whole operation if post-processing fails
+            output_msg = [f"Warning: Failed to post-process init_data hash: {e}"]
 
         # Return success message with output
         output_msg = [
@@ -640,30 +693,53 @@ def detect_kata_kernel_params() -> str:
 @mcp.tool()
 def update_reference_values_configmap() -> str:
     """
-    Update the trusteeconfig-rvps-reference-values ConfigMap with values from rvps-reference-values.yaml.
+    Generate fresh reference values and update the trusteeconfig-rvps-reference-values ConfigMap.
 
-    This reads the generated reference values from the local rvps-reference-values.yaml file and
-    updates the operator-managed ConfigMap (trusteeconfig-rvps-reference-values) that is mounted
-    by the trustee deployment.
+    This function:
+    1. Auto-downloads pull secret from cluster if not already present
+    2. Generates fresh initdata.toml from cluster (CRITICAL: must be done before reference values)
+    3. Auto-detects platform, TEE, and OCP version from the cluster
+    4. Generates fresh reference values using the initdata.toml
+    5. Updates the operator-managed ConfigMap (trusteeconfig-rvps-reference-values)
 
-    The source YAML file has data in the 'reference-values' key (YAML string), while the
-    target ConfigMap needs it in the 'reference-values.json' key (JSON string) which is
-    what RVPS actually reads.
+    The ConfigMap is mounted by the trustee deployment and used by RVPS for attestation verification.
 
     Returns:
-        Success message or error message
+        Success message with generation and update details, or error message
     """
     try:
         import yaml
         import tempfile
         import os
 
-        # Check if local rvps-reference-values.yaml exists
+        # Step 1: Ensure pull secret exists
+        authfile = "pull-secret.json"
+        if not os.path.exists(authfile):
+            print(f"Pull secret not found, downloading from cluster...")
+            download_result = download_pull_secret(authfile)
+            if download_result.startswith("Error"):
+                return f"Failed to download pull secret:\n{download_result}"
+
+        # Step 2: Generate fresh initdata.toml from cluster BEFORE generating reference values
+        # This ensures reference values match the initdata that will be used by the test pod
+        print("Generating fresh initdata.toml from cluster...")
+        initdata_result = generate_initdata()
+        if initdata_result.startswith("Error:"):
+            return f"Failed to generate initdata.toml:\n{initdata_result}"
+
+        # Step 3: Generate fresh reference values with authentication using the initdata.toml
+        print("Generating fresh reference values...")
+        generation_result = generate_reference_values(authfile=authfile)
+
+        if generation_result.startswith("Error"):
+            return f"Failed to generate reference values:\n{generation_result}"
+
+        # Step 3: Check if local rvps-reference-values.yaml was created
         yaml_file = "rvps-reference-values.yaml"
         if not os.path.exists(yaml_file):
-            return f"Error: {yaml_file} not found. Run generate_reference_values() first."
+            return f"Error: {yaml_file} not found after generation. Generation output:\n{generation_result}"
 
-        # Read and parse the generated YAML file
+        # Step 4: Read and parse the generated YAML file
         with open(yaml_file, 'r') as f:
             source_cm = yaml.safe_load(f)
 
@@ -676,7 +752,7 @@ def update_reference_values_configmap() -> str:
         if not ref_values or ref_values.strip() == "":
             return "Error: reference-values data is empty in the YAML file."
 
-        # Get the current target ConfigMap
+        # Step 5: Get the current target ConfigMap
         result = subprocess.run(
             ["kubectl", "get", "configmap", "trusteeconfig-rvps-reference-values", "-n", "trustee-operator-system", "-o", "yaml"],
             capture_output=True, text=True
@@ -688,13 +764,13 @@ def update_reference_values_configmap() -> str:
         # Parse the ConfigMap
         cm = yaml.safe_load(result.stdout)
 
-        # Update the reference-values.json key (this is what RVPS reads)
+        # Step 6: Update the reference-values.json key (this is what RVPS reads)
         if 'data' not in cm:
             cm['data'] = {}
 
         cm['data']['reference-values.json'] = ref_values
 
-        # Write to temporary file and apply
+        # Step 7: Write to temporary file and apply
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             yaml.dump(cm, f)
             temp_file = f.name
@@ -709,6 +785,11 @@ def update_reference_values_configmap() -> str:
                 return f"Error: Failed to apply ConfigMap\n{result.stderr}"
 
             return (
+                "=== Initdata Generation ===\n\n"
+                f"{initdata_result}\n\n"
+                "=== Reference Values Generation ===\n\n"
+                f"{generation_result}\n\n"
+                "=== ConfigMap Update ===\n\n"
                 "Successfully updated trusteeconfig-rvps-reference-values ConfigMap.\n"
                 "Updated 'reference-values.json' key (used by RVPS).\n\n"
                 "The new reference values will be automatically synced to the trustee pod within 60-90 seconds.\n"
@@ -1290,6 +1371,147 @@ def create_trustee_config(
         return "Error: PyYAML library is required. Install it with: pip install pyyaml"
     except Exception as e:
         return f"Error: Failed to create TrusteeConfig: {e}"
+
+@mcp.tool()
+def prepare_attestation_test() -> str:
+    """
+    Complete workflow to prepare for attestation testing with matching reference values.
+
+    This function executes the correct sequence to ensure reference values and test pod
+    use identical initdata.toml:
+    1. Generate fresh initdata.toml from cluster
+    2. Generate reference values using that initdata.toml
+    3. Update the ConfigMap with new reference values
+    4. Generate test-pod.yaml using the SAME initdata.toml
+
+    Returns:
+        Success message with details of all steps, or error message
+    """
+    import os
+
+    try:
+        output = []
+        output.append("=== Complete Attestation Test Preparation Workflow ===\n")
+
+        # Step 1: Ensure pull secret exists
+        authfile = "pull-secret.json"
+        if not os.path.exists(authfile):
+            output.append("Step 1: Downloading pull secret from cluster...")
+            download_result = download_pull_secret(authfile)
+            if download_result.startswith("Error"):
+                return f"Failed to download pull secret:\n{download_result}"
+            output.append(f"  ✓ {download_result}\n")
+        else:
+            output.append(f"Step 1: Using existing pull secret ({authfile})\n")
+
+        # Step 2: Generate fresh initdata.toml
+        output.append("Step 2: Generating fresh initdata.toml from cluster...")
+        initdata_result = generate_initdata()
+        if initdata_result.startswith("Error:"):
+            return f"\nFailed at Step 2:\n{initdata_result}"
+        output.append(f"  ✓ {initdata_result}\n")
+
+        # Step 3: Generate reference values using the fresh initdata.toml
+        output.append("Step 3: Generating reference values with the initdata.toml...")
+        generation_result = generate_reference_values(authfile=authfile)
+        if generation_result.startswith("Error"):
+            return f"\nFailed at Step 3:\n{generation_result}"
+        output.append(f"  ✓ Reference values generated\n")
+
+        # Step 4: Update the ConfigMap
+        output.append("Step 4: Updating trusteeconfig-rvps-reference-values ConfigMap...")
+
+        import yaml
+        import tempfile
+        yaml_file = "rvps-reference-values.yaml"
+        if not os.path.exists(yaml_file):
+            return f"\nFailed at Step 4: {yaml_file} not found after generation"
+
+        with open(yaml_file, 'r') as f:
+            source_cm = yaml.safe_load(f)
+
+        if 'data' not in source_cm or 'reference-values' not in source_cm['data']:
+            return f"\nFailed at Step 4: {yaml_file} does not contain reference-values data"
+
+        ref_values = source_cm['data']['reference-values']
+        if not ref_values or ref_values.strip() == "":
+            return "\nFailed at Step 4: reference-values data is empty"
+
+        result = subprocess.run(
+            ["kubectl", "get", "configmap", "trusteeconfig-rvps-reference-values",
+             "-n", "trustee-operator-system", "-o", "yaml"],
+            capture_output=True, text=True
+        )
+
+        if result.returncode != 0:
+            return "\nFailed at Step 4: Target ConfigMap 'trusteeconfig-rvps-reference-values' not found"
+
+        cm = yaml.safe_load(result.stdout)
+        if 'data' not in cm:
+            cm['data'] = {}
+        cm['data']['reference-values.json'] = ref_values
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+            yaml.dump(cm, f)
+            temp_file = f.name
+
+        try:
+            result = subprocess.run(
+                ["kubectl", "apply", "-f", temp_file],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return f"\nFailed at Step 4: {result.stderr}"
+            output.append("  ✓ ConfigMap updated successfully\n")
+        finally:
+            try:
+                os.unlink(temp_file)
+            except:
+                pass
+
+        # Step 5: Generate test-pod.yaml using the SAME initdata.toml (don't regenerate!)
+        output.append("Step 5: Generating test-pod.yaml using the same initdata.toml...")
+
+        # Read the existing initdata.toml that was used for reference values
+        try:
+            with open("initdata.toml", "r") as f:
+                initdata_content = f.read()
+        except FileNotFoundError:
+            return "\nFailed at Step 5: initdata.toml not found"
+
+        import gzip
+        import base64
+        initdata_gzipped = gzip.compress(initdata_content.encode('utf-8'))
+        initdata_base64 = base64.b64encode(initdata_gzipped).decode('utf-8')
+
+        try:
+            with open("test-pod.yaml.in", "r") as f:
+                template = f.read()
+        except FileNotFoundError:
+            return "\nFailed at Step 5: test-pod.yaml.in template file not found"
+
+        pod_output = template.replace('${INITDATA}', initdata_base64)
+        with open("test-pod.yaml", "w") as f:
+            f.write(pod_output)
+
+        output.append(f"  ✓ test-pod.yaml generated ({len(initdata_base64)} bytes of initdata)\n")
+
+        # Final summary
+        output.append("\n=== Summary ===\n")
+        output.append("✓ All steps completed successfully!")
+        output.append("✓ Reference values and test pod use IDENTICAL initdata.toml")
+        output.append("\nNext steps:")
+        output.append("  1. kubectl apply -f test-pod.yaml")
+        output.append("  2. kubectl wait --for=condition=Ready pod/ocp-cc-pod --timeout=120s")
+        output.append("  3. Use get_attestation_token() or summarize_attestation_token()")
+        output.append("\nNote: The ConfigMap update will sync to the trustee pod within 60-90 seconds.")
+
+        return "\n".join(output)
+
+    except ImportError:
+        return "Error: PyYAML library is required. Install it with: pip install pyyaml"
+    except Exception as e:
+        return f"Error: Workflow failed: {e}"
 
 @mcp.tool()
 def delete_trustee_config(
