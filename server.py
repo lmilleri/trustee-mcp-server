@@ -1533,6 +1533,407 @@ def prepare_attestation_test() -> str:
         return f"Error: Workflow failed: {e}"
 
 @mcp.tool()
+def get_resource_backend_type(
+    config_name: str = "trusteeconfig",
+    namespace: str = "trustee-operator-system"
+) -> str:
+    """
+    Get the resource backend type from the kbs-config ConfigMap.
+
+    Args:
+        config_name: Name of the TrusteeConfig resource (default: "trusteeconfig")
+        namespace: Namespace where the ConfigMap exists (default: "trustee-operator-system")
+
+    Returns:
+        Resource backend type (e.g., "LocalFs", "CosmosDB") or error message
+    """
+    try:
+        import toml
+
+        # Get the kbs-config ConfigMap
+        configmap_name = f"{config_name}-kbs-config"
+        cmd = [
+            "kubectl", "get", "configmap", configmap_name,
+            "-n", namespace,
+            "-o", "jsonpath='{.data.kbs-config\\.toml}'"
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return f"Error: Failed to get ConfigMap '{configmap_name}'\n{result.stderr}"
+
+        if not result.stdout or result.stdout.strip() == "''":
+            return f"Error: ConfigMap '{configmap_name}' exists but has no kbs-config.toml data"
+
+        # Remove surrounding quotes if present
+        toml_content = result.stdout.strip().strip("'")
+
+        if not toml_content:
+            return f"Error: kbs-config.toml is empty in ConfigMap '{configmap_name}'"
+
+        # Parse the TOML content
+        try:
+            config = toml.loads(toml_content)
+        except Exception as e:
+            return f"Error: Failed to parse TOML content: {e}\n\nContent:\n{toml_content[:500]}..."
+
+        # Extract the resource plugin type
+        plugins = config.get("plugins", [])
+
+        if not plugins:
+            return "Error: No plugins section found in kbs-config.toml"
+
+        # Find the resource plugin
+        resource_plugin = None
+        for plugin in plugins:
+            if isinstance(plugin, dict) and plugin.get("name") == "resource":
+                resource_plugin = plugin
+                break
+
+        if not resource_plugin:
+            return "Error: No resource plugin found in plugins section"
+
+        plugin_type = resource_plugin.get("type")
+
+        if not plugin_type:
+            return "Error: Resource plugin found but has no 'type' field"
+
+        # Return detailed information
+        output = [
+            f"Resource Backend Type: {plugin_type}",
+            f"\nConfigMap: {configmap_name}",
+            f"Namespace: {namespace}",
+            f"\nFull resource plugin configuration:"
+        ]
+
+        for key, value in resource_plugin.items():
+            output.append(f"  {key}: {value}")
+
+        return "\n".join(output)
+
+    except ImportError:
+        return "Error: toml library is required. Install it with: pip install toml"
+    except Exception as e:
+        return f"Error: Failed to get resource backend type: {e}"
+
+@mcp.tool()
+def create_kbs_secret_resource(
+    secret_name: str,
+    secret_data: dict,
+    config_name: str = "trusteeconfig",
+    namespace: str = "trustee-operator-system",
+    update_if_exists: bool = False
+) -> str:
+    """
+    Create a Kubernetes secret and register it with the KbsConfig resource.
+
+    This creates a generic Kubernetes secret and adds it to the KbsConfig's
+    kbsSecretResources list so it can be retrieved through attestation.
+
+    Args:
+        secret_name: Name of the secret to create
+        secret_data: Dictionary of key-value pairs for the secret (e.g., {"key1": "value1", "key2": "value2"})
+        config_name: Name of the TrusteeConfig resource (default: "trusteeconfig")
+        namespace: Namespace to create the secret in (default: "trustee-operator-system")
+        update_if_exists: If True, update the secret if it already exists (default: False)
+
+    Returns:
+        Success message with details of created secret and KbsConfig update, or error message
+
+    Example:
+        create_kbs_secret_resource("my-secret", {"api-key": "secret123", "token": "xyz"})
+    """
+    try:
+        import yaml
+
+        output_messages = []
+        output_messages.append("=== Creating KBS Secret Resource ===\n")
+
+        # Step 1: Check if the secret already exists
+        check_secret_cmd = [
+            "kubectl", "get", "secret", secret_name,
+            "-n", namespace,
+            "-o", "json"
+        ]
+
+        result = subprocess.run(check_secret_cmd, capture_output=True, text=True)
+
+        secret_exists = result.returncode == 0
+
+        if secret_exists:
+            if update_if_exists:
+                output_messages.append(f"Secret '{secret_name}' already exists, deleting and recreating...\n")
+
+                # Delete the existing secret
+                delete_cmd = ["kubectl", "delete", "secret", secret_name, "-n", namespace]
+                result = subprocess.run(delete_cmd, capture_output=True, text=True)
+
+                if result.returncode != 0:
+                    return f"Error: Failed to delete existing secret for update\n{result.stderr}"
+            else:
+                output_messages.append(f"⚠ Secret '{secret_name}' already exists in namespace '{namespace}'")
+                output_messages.append("  Use update_if_exists=True to replace it, or use a different name.\n")
+                # Don't create, but continue to check KbsConfig registration
+                secret_exists = True
+
+        # Step 2: Create the secret (if it doesn't exist or we're updating)
+        if not secret_exists or update_if_exists:
+            create_cmd = [
+                "kubectl", "create", "secret", "generic", secret_name,
+                "-n", namespace
+            ]
+
+            # Add each key-value pair from secret_data
+            for key, value in secret_data.items():
+                create_cmd.extend(["--from-literal", f"{key}={value}"])
+
+            # Execute the secret creation
+            result = subprocess.run(create_cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                return f"Error: Failed to create secret\n{result.stderr}"
+
+            output_messages.append(f"✓ Created secret: {secret_name}")
+            output_messages.append(f"  Namespace: {namespace}")
+            output_messages.append(f"  Keys: {', '.join(secret_data.keys())}\n")
+
+        # Step 3: Check if the secret is already registered in KbsConfig
+        output_messages.append("=== Registering with KbsConfig ===\n")
+
+        kbs_config_name = f"{config_name}-kbs-config"
+        get_kbs_cmd = [
+            "kubectl", "get", "KbsConfig",
+            kbs_config_name,
+            "-n", namespace,
+            "-o", "yaml"
+        ]
+
+        result = subprocess.run(get_kbs_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return f"Error: KbsConfig '{kbs_config_name}' not found in namespace '{namespace}'\n{result.stderr}"
+
+        # Parse the KbsConfig
+        kbs_config = yaml.safe_load(result.stdout)
+        spec = kbs_config.get("spec", {})
+        secret_resources = spec.get("kbsSecretResources", [])
+
+        # Check if the secret is already registered
+        if secret_name in secret_resources:
+            output_messages.append(f"✓ Secret '{secret_name}' is already registered with KbsConfig '{kbs_config_name}'")
+        else:
+            # Patch the KbsConfig to add the secret to kbsSecretResources
+            patch_cmd = [
+                "kubectl", "patch", "KbsConfig",
+                kbs_config_name,
+                "-n", namespace,
+                "--type=json",
+                f"-p=[{{\"op\":\"add\", \"path\":\"/spec/kbsSecretResources/-\", \"value\":\"{secret_name}\"}}]"
+            ]
+
+            result = subprocess.run(patch_cmd, capture_output=True, text=True)
+
+            if result.returncode != 0:
+                return f"Error: Secret created but failed to register with KbsConfig\n{result.stderr}"
+
+            output_messages.append(f"✓ Registered secret '{secret_name}' with KbsConfig '{kbs_config_name}'")
+
+        output_messages.append(f"\nThe secret is now available for retrieval through KBS attestation.")
+        output_messages.append(f"Resource path: default/{secret_name}/<key>")
+        output_messages.append(f"Available keys: {', '.join(secret_data.keys())}")
+
+        return "\n".join(output_messages)
+
+    except ImportError:
+        return "Error: PyYAML library is required. Install it with: pip install pyyaml"
+    except Exception as e:
+        return f"Error: Failed to create KBS secret resource: {e}"
+
+@mcp.tool()
+def delete_kbs_secret_resource(
+    secret_name: str,
+    config_name: str = "trusteeconfig",
+    namespace: str = "trustee-operator-system",
+    delete_secret: bool = True
+) -> str:
+    """
+    Remove a secret from the KbsConfig and optionally delete the Kubernetes secret.
+
+    Args:
+        secret_name: Name of the secret to remove
+        config_name: Name of the TrusteeConfig resource (default: "trusteeconfig")
+        namespace: Namespace where the secret exists (default: "trustee-operator-system")
+        delete_secret: Also delete the Kubernetes secret itself (default: True)
+
+    Returns:
+        Success message with details of what was removed, or error message
+    """
+    try:
+        import yaml
+
+        output_messages = []
+        output_messages.append("=== Removing KBS Secret Resource ===\n")
+
+        # Step 1: Get the current KbsConfig to find the secret's index
+        kbs_config_name = f"{config_name}-kbs-config"
+        get_cmd = [
+            "kubectl", "get", "KbsConfig",
+            kbs_config_name,
+            "-n", namespace,
+            "-o", "yaml"
+        ]
+
+        result = subprocess.run(get_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return f"Error: KbsConfig '{kbs_config_name}' not found in namespace '{namespace}'\n{result.stderr}"
+
+        # Parse the KbsConfig
+        kbs_config = yaml.safe_load(result.stdout)
+        spec = kbs_config.get("spec", {})
+        secret_resources = spec.get("kbsSecretResources", [])
+
+        # Find the index of the secret
+        try:
+            secret_index = secret_resources.index(secret_name)
+        except ValueError:
+            return f"Error: Secret '{secret_name}' is not registered in KbsConfig '{kbs_config_name}'"
+
+        # Step 2: Remove the secret from kbsSecretResources
+        output_messages.append(f"Removing '{secret_name}' from KbsConfig...\n")
+
+        patch_cmd = [
+            "kubectl", "patch", "KbsConfig",
+            kbs_config_name,
+            "-n", namespace,
+            "--type=json",
+            f"-p=[{{\"op\":\"remove\", \"path\":\"/spec/kbsSecretResources/{secret_index}\"}}]"
+        ]
+
+        result = subprocess.run(patch_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return f"Error: Failed to remove secret from KbsConfig\n{result.stderr}"
+
+        output_messages.append(f"✓ Removed '{secret_name}' from KbsConfig '{kbs_config_name}'")
+
+        # Step 3: Delete the Kubernetes secret if requested
+        if delete_secret:
+            output_messages.append("\n=== Deleting Kubernetes Secret ===\n")
+
+            delete_cmd = [
+                "kubectl", "delete", "secret",
+                secret_name,
+                "-n", namespace,
+                "--ignore-not-found=true"
+            ]
+
+            result = subprocess.run(delete_cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                output_messages.append(f"✓ Deleted secret: {secret_name}")
+            else:
+                output_messages.append(f"⚠ Failed to delete secret: {secret_name}\n  {result.stderr.strip()}")
+        else:
+            output_messages.append(f"\nKubernetes secret '{secret_name}' was not deleted (delete_secret=False)")
+
+        output_messages.append("\n✓ KBS secret resource removal completed successfully!")
+
+        return "\n".join(output_messages)
+
+    except ImportError:
+        return "Error: PyYAML library is required. Install it with: pip install pyyaml"
+    except Exception as e:
+        return f"Error: Failed to delete KBS secret resource: {e}"
+
+@mcp.tool()
+def list_kbs_secret_resources(
+    config_name: str = "trusteeconfig",
+    namespace: str = "trustee-operator-system"
+) -> str:
+    """
+    List all secrets registered with the KbsConfig.
+
+    Args:
+        config_name: Name of the TrusteeConfig resource (default: "trusteeconfig")
+        namespace: Namespace where the KbsConfig exists (default: "trustee-operator-system")
+
+    Returns:
+        List of registered secrets with their details, or error message
+    """
+    try:
+        import yaml
+
+        output_messages = []
+        output_messages.append("=== KBS Secret Resources ===\n")
+
+        # Get the KbsConfig
+        kbs_config_name = f"{config_name}-kbs-config"
+        get_cmd = [
+            "kubectl", "get", "KbsConfig",
+            kbs_config_name,
+            "-n", namespace,
+            "-o", "yaml"
+        ]
+
+        result = subprocess.run(get_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            return f"Error: KbsConfig '{kbs_config_name}' not found in namespace '{namespace}'\n{result.stderr}"
+
+        # Parse the KbsConfig
+        kbs_config = yaml.safe_load(result.stdout)
+        spec = kbs_config.get("spec", {})
+        secret_resources = spec.get("kbsSecretResources", [])
+
+        if not secret_resources:
+            output_messages.append("No secrets are currently registered with KbsConfig.\n")
+            output_messages.append("Use create_kbs_secret_resource() to add secrets.")
+            return "\n".join(output_messages)
+
+        output_messages.append(f"KbsConfig: {kbs_config_name}")
+        output_messages.append(f"Namespace: {namespace}")
+        output_messages.append(f"Total secrets: {len(secret_resources)}\n")
+
+        # Get details for each secret
+        for i, secret_name in enumerate(secret_resources, 1):
+            output_messages.append(f"{i}. {secret_name}")
+
+            # Try to get the secret details
+            secret_cmd = [
+                "kubectl", "get", "secret",
+                secret_name,
+                "-n", namespace,
+                "-o", "json"
+            ]
+
+            result = subprocess.run(secret_cmd, capture_output=True, text=True)
+
+            if result.returncode == 0:
+                try:
+                    secret_data = json.loads(result.stdout)
+                    data_keys = list(secret_data.get("data", {}).keys())
+                    secret_type = secret_data.get("type", "unknown")
+
+                    output_messages.append(f"   Type: {secret_type}")
+                    output_messages.append(f"   Keys: {', '.join(data_keys) if data_keys else 'none'}")
+                    output_messages.append(f"   Resource paths: " + ", ".join([f"default/{secret_name}/{key}" for key in data_keys]))
+                except Exception as e:
+                    output_messages.append(f"   ⚠ Could not parse secret details: {e}")
+            else:
+                output_messages.append(f"   ⚠ Secret not found in cluster (may have been deleted)")
+
+            output_messages.append("")
+
+        return "\n".join(output_messages)
+
+    except ImportError:
+        return "Error: PyYAML library is required. Install it with: pip install pyyaml"
+    except Exception as e:
+        return f"Error: Failed to list KBS secret resources: {e}"
+
+@mcp.tool()
 def delete_trustee_config(
     config_name: str = "trusteeconfig",
     namespace: str = "trustee-operator-system",

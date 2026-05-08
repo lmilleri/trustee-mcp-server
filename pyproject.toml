@@ -8,5 +8,6 @@ dependencies = [
     "kubernetes>=35.0.0",
     "mcp>=1.27.0",
     "pyyaml>=6.0.3",
+    "toml>=0.10.2",
     "veritas>=0.1.12",
 ]
